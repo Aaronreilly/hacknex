@@ -1,53 +1,53 @@
+
 import cv2
 import math
-from pathlib import Path
-
+import os
 import mediapipe as mp
 from ultralytics import YOLO
-
-
-# ============================================================
-# PATHS
-# ============================================================
-
-BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = BASE_DIR / "models" / "best_person_bag.pt"
-POSE_MODEL_PATH = BASE_DIR / "models" / "yolov8n-pose.pt"
-HAND_MODEL_PATH = BASE_DIR / "models" / "hand_landmarker.task"
+from pathlib import Path
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
+MODEL_PATH = "models/best_person_bag.pt"
+POSE_MODEL_PATH = "yolov8n-pose.pt"
+HAND_MODEL_PATH = "models/hand_landmarker.task"
+
+VIDEO_PATH = "videos/bag4.mp4"
+OUTPUT_PATH = "outputs/person_bag_movement.mp4"
+
+# Detection
 CONFIDENCE = 0.25
 
+# Hand / bag relationship
 HAND_BAG_DISTANCE = 300
 
+# Movement thresholds
 BAG_MOVEMENT_THRESHOLD = 4
 PERSON_MOVEMENT_THRESHOLD = 4
 
+# Number of frames required for events
 PICKING_FRAMES = 4
 PICKED_FRAMES = 4
 CARRYING_FRAMES = 6
 KEPT_FRAMES = 10
 PLACED_FRAMES = 10
 
-HAND_MEMORY_FRAMES = 30
-BAG_MEMORY_FRAMES = 20
+# Memory
+HAND_MEMORY_FRAMES = 60
+BAG_MEMORY_FRAMES = 30
+PERSON_MEMORY_FRAMES = 15
 
 
 # ============================================================
-# HELPERS
+# HELPER FUNCTIONS
 # ============================================================
 
 def center_of_box(box):
     x1, y1, x2, y2 = box
-    return (
-        (x1 + x2) // 2,
-        (y1 + y2) // 2
-    )
+    return ((x1 + x2) // 2, (y1 + y2) // 2)
 
 
 def distance(p1, p2):
@@ -57,8 +57,13 @@ def distance(p1, p2):
     )
 
 
-def movement(previous, current):
+def box_distance(box1, box2):
+    c1 = center_of_box(box1)
+    c2 = center_of_box(box2)
+    return distance(c1, c2)
 
+
+def movement_amount(previous, current):
     if previous is None or current is None:
         return 0
 
@@ -66,6 +71,10 @@ def movement(previous, current):
 
 
 def nearest_bag(bags, previous_center):
+    """
+    If multiple bags are detected, choose the one closest
+    to the previous bag position.
+    """
 
     if not bags:
         return None
@@ -73,77 +82,61 @@ def nearest_bag(bags, previous_center):
     if previous_center is None:
         return bags[0]
 
-    best = None
+    best_bag = None
     best_distance = float("inf")
 
     for bag in bags:
+        current_center = center_of_box(bag)
 
-        c = center_of_box(bag)
-
-        d = distance(
-            previous_center,
-            c
-        )
+        d = distance(previous_center, current_center)
 
         if d < best_distance:
             best_distance = d
-            best = bag
+            best_bag = bag
 
-    return best
+    return best_bag
 
-
-# ============================================================
-# HAND FUNCTIONS
-# ============================================================
 
 def get_hand_points(result, width, height):
+    """
+    Convert MediaPipe hand landmarks into pixel coordinates.
+    """
 
-    hands = []
+    points = []
 
     if result is None:
-        return hands
+        return points
 
     for hand in result.hand_landmarks:
 
-        points = []
+        hand_points = []
 
         for landmark in hand:
+            x = int(landmark.x * width)
+            y = int(landmark.y * height)
 
-            x = int(
-                landmark.x * width
-            )
+            hand_points.append((x, y))
 
-            y = int(
-                landmark.y * height
-            )
+        points.append(hand_points)
 
-            points.append(
-                (x, y)
-            )
-
-        hands.append(points)
-
-    return hands
+    return points
 
 
-def nearest_hand_distance(
-    hands,
-    bag_center
-):
+def nearest_hand_distance(hand_points, bag_center):
+    """
+    Find the nearest hand landmark to the bag.
+    """
 
-    if not hands or bag_center is None:
+    if not hand_points or bag_center is None:
         return None
 
     minimum = float("inf")
 
-    for hand in hands:
+    for hand in hand_points:
 
         for point in hand:
 
-            d = distance(
-                point,
-                bag_center
-            )
+            d = distance(point, bag_center)
 
             if d < minimum:
                 minimum = d
@@ -151,12 +144,20 @@ def nearest_hand_distance(
     return minimum
 
 
-def get_gesture(hands):
+def get_gesture(hand_points):
+    """
+    Very simple gesture estimation.
 
-    if not hands:
+    This is intentionally basic.
+    It is used only as supporting information,
+    not as the main pickup decision.
+    """
+
+    if not hand_points:
         return "UNKNOWN"
 
-    hand = hands[0]
+    # Use first detected hand
+    hand = hand_points[0]
 
     if len(hand) < 21:
         return "UNKNOWN"
@@ -164,25 +165,18 @@ def get_gesture(hands):
     wrist = hand[0]
 
     fingers = [
-        (8, 5),
-        (12, 9),
-        (16, 13),
-        (20, 17)
+        (8, 5),    # index
+        (12, 9),   # middle
+        (16, 13),  # ring
+        (20, 17)   # pinky
     ]
 
     extended = 0
 
     for tip, base in fingers:
 
-        tip_distance = distance(
-            hand[tip],
-            wrist
-        )
-
-        base_distance = distance(
-            hand[base],
-            wrist
-        )
+        tip_distance = distance(hand[tip], wrist)
+        base_distance = distance(hand[base], wrist)
 
         if tip_distance > base_distance * 1.15:
             extended += 1
@@ -196,43 +190,22 @@ def get_gesture(hands):
     return "PARTIAL"
 
 
-# ============================================================
-# DRAW HAND
-# ============================================================
-
-def draw_hands(frame, hands):
+def draw_hand(frame, hand_points):
+    """
+    Draw MediaPipe hand skeleton.
+    """
 
     connections = [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 4),
-
-        (0, 5),
-        (5, 6),
-        (6, 7),
-        (7, 8),
-
-        (0, 9),
-        (9, 10),
-        (10, 11),
-        (11, 12),
-
-        (0, 13),
-        (13, 14),
-        (14, 15),
-        (15, 16),
-
-        (0, 17),
-        (17, 18),
-        (18, 19),
-        (19, 20)
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        (0, 9), (9, 10), (10, 11), (11, 12),
+        (0, 13), (13, 14), (14, 15), (15, 16),
+        (0, 17), (17, 18), (18, 19), (19, 20)
     ]
 
-    for hand in hands:
+    for hand in hand_points:
 
         for point in hand:
-
             cv2.circle(
                 frame,
                 point,
@@ -252,58 +225,66 @@ def draw_hands(frame, hands):
             )
 
 
-# ============================================================
-# DRAW POSE
-# ============================================================
+def draw_pose(frame, pose_result):
+    """
+    Draw YOLO pose skeleton.
+    """
 
-def draw_pose(frame, pose_results):
+    if pose_result is None:
+        return
 
-    skeleton = [
-        (5, 6),
-        (5, 7),
-        (7, 9),
-        (6, 8),
-        (8, 10),
-        (5, 11),
-        (6, 12),
-        (11, 12),
-        (11, 13),
-        (13, 15),
-        (12, 14),
-        (14, 16)
-    ]
-
-    for result in pose_results:
+    for result in pose_result:
 
         if result.keypoints is None:
             continue
 
-        points = result.keypoints.xy.cpu().numpy()
+        if result.keypoints.xy is None:
+            continue
 
-        for person in points:
+        keypoints = result.keypoints.xy.cpu().numpy()
 
-            for x, y in person:
+        for person_points in keypoints:
 
-                if x > 0 and y > 0:
+            # Draw joints
+            for x, y in person_points:
 
-                    cv2.circle(
-                        frame,
-                        (int(x), int(y)),
-                        4,
-                        (255, 0, 255),
-                        -1
-                    )
+                if x <= 0 or y <= 0:
+                    continue
+
+                cv2.circle(
+                    frame,
+                    (int(x), int(y)),
+                    4,
+                    (255, 0, 255),
+                    -1
+                )
+
+            # COCO skeleton connections
+            skeleton = [
+                (5, 6),
+                (5, 7),
+                (7, 9),
+                (6, 8),
+                (8, 10),
+                (5, 11),
+                (6, 12),
+                (11, 12),
+                (11, 13),
+                (13, 15),
+                (12, 14),
+                (14, 16)
+            ]
 
             for a, b in skeleton:
 
-                if a >= len(person):
+                if a >= len(person_points):
                     continue
 
-                if b >= len(person):
+                if b >= len(person_points):
                     continue
 
-                x1, y1 = person[a]
-                x2, y2 = person[b]
+                x1, y1 = person_points[a]
+                x2, y2 = person_points[b]
 
                 if x1 <= 0 or y1 <= 0:
                     continue
@@ -320,16 +301,7 @@ def draw_pose(frame, pose_results):
                 )
 
 
-# ============================================================
-# DRAW BOX
-# ============================================================
-
-def draw_box(
-    frame,
-    box,
-    label,
-    color
-):
+def draw_box(frame, box, label, color):
 
     x1, y1, x2, y2 = box
 
@@ -341,10 +313,12 @@ def draw_box(
         3
     )
 
+    text_y = max(30, y1 - 10)
+
     cv2.putText(
         frame,
         label,
-        (x1, max(30, y1 - 10)),
+        (x1, text_y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         color,
@@ -353,573 +327,667 @@ def draw_box(
 
 
 # ============================================================
-# MAIN PROCESSING FUNCTION
+# LOAD MODELS
 # ============================================================
 
-def process_video(
-    input_path,
-    output_path
-):
+print()
+print("======================================")
+print("LOADING AI MODELS")
+print("======================================")
 
-    print("Loading trained YOLO model...")
+print("Loading person + bag model...")
+model = YOLO(MODEL_PATH)
 
-    model = YOLO(
-        str(MODEL_PATH)
+print("Loading pose model...")
+pose_model = YOLO(POSE_MODEL_PATH)
+
+print("Loading MediaPipe hand model...")
+
+BaseOptions = mp.tasks.BaseOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+
+hand_options = HandLandmarkerOptions(
+    base_options=BaseOptions(
+        model_asset_path=HAND_MODEL_PATH
+    ),
+    running_mode=VisionRunningMode.IMAGE,
+    num_hands=2
+)
+
+hand_detector = HandLandmarker.create_from_options(
+    hand_options
+)
+
+print("ALL MODELS READY")
+
+
+# ============================================================
+# OPEN VIDEO
+# ============================================================
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+if not cap.isOpened():
+
+    print()
+    print("ERROR: Could not open video:")
+    print(VIDEO_PATH)
+
+    hand_detector.close()
+    exit()
+
+
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+if fps <= 0:
+    fps = 30
+
+
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+
+# ============================================================
+# OUTPUT VIDEO
+# ============================================================
+
+Path("outputs").mkdir(exist_ok=True)
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+out = cv2.VideoWriter(
+    OUTPUT_PATH,
+    fourcc,
+    fps,
+    (width, height)
+)
+
+
+# ============================================================
+# OPENCV DISPLAY WINDOW
+# ============================================================
+
+WINDOW_NAME = "PERSON + BAG AI"
+
+cv2.namedWindow(
+    WINDOW_NAME,
+    cv2.WINDOW_NORMAL
+)
+
+cv2.resizeWindow(
+    WINDOW_NAME,
+    1200,
+    700
+)
+
+
+# ============================================================
+# STATE VARIABLES
+# ============================================================
+
+state = "WAITING"
+
+frame_number = 0
+
+previous_bag_center = None
+previous_person_center = None
+
+bag_center = None
+person_center = None
+
+last_bag_box = None
+
+hand_points = []
+
+last_hand_points = []
+hand_missing_frames = 0
+
+bag_missing_frames = 0
+person_missing_frames = 0
+
+previous_bag_visible = False
+previous_person_visible = False
+
+
+# Movement
+bag_movement = 0
+person_movement = 0
+
+total_bag_movement = 0
+total_person_movement = 0
+
+
+# Event counters
+picking_counter = 0
+picked_counter = 0
+carrying_counter = 0
+kept_counter = 0
+placed_counter = 0
+
+
+# State history
+was_picked = False
+was_carried = False
+was_kept = False
+
+
+# ============================================================
+# START
+# ============================================================
+
+print()
+print("======================================")
+print("PERSON + BAG MOVEMENT STARTED")
+print("Press Q to stop")
+print("======================================")
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+while True:
+
+    ret, frame = cap.read()
+
+    if not ret:
+        break
+
+    frame_number += 1
+
+    # --------------------------------------------------------
+    # YOLO PERSON + BAG DETECTION
+    # --------------------------------------------------------
+
+    results = model.predict(
+        frame,
+        conf=CONFIDENCE,
+        verbose=False
     )
 
-    print("Loading pose model...")
+    persons = []
+    bags = []
 
-    pose_model = YOLO(
-        str(POSE_MODEL_PATH)
-    )
+    for result in results:
 
-    print("Loading MediaPipe...")
+        if result.boxes is None:
+            continue
 
-    BaseOptions = mp.tasks.BaseOptions
+        for box in result.boxes:
 
-    VisionRunningMode = (
-        mp.tasks.vision.RunningMode
-    )
+            class_id = int(box.cls[0])
+            confidence = float(box.conf[0])
 
-    HandLandmarkerOptions = (
-        mp.tasks.vision.HandLandmarkerOptions
-    )
-
-    HandLandmarker = (
-        mp.tasks.vision.HandLandmarker
-    )
-
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(
-            model_asset_path=str(
-                HAND_MODEL_PATH
+            x1, y1, x2, y2 = map(
+                int,
+                box.xyxy[0].tolist()
             )
-        ),
-        running_mode=VisionRunningMode.IMAGE,
-        num_hands=2
-    )
 
-    hand_detector = (
-        HandLandmarker.create_from_options(
-            options
-        )
-    )
+            detected_box = (
+                x1,
+                y1,
+                x2,
+                y2
+            )
 
-    # --------------------------------------------------------
-    # VIDEO
-    # --------------------------------------------------------
+            if class_id == 0:
 
-    cap = cv2.VideoCapture(
-        str(input_path)
-    )
-
-    if not cap.isOpened():
-
-        hand_detector.close()
-
-        raise RuntimeError(
-            "Could not open input video"
-        )
-
-    fps = cap.get(
-        cv2.CAP_PROP_FPS
-    )
-
-    if fps <= 0:
-        fps = 30
-
-    width = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_WIDTH
-        )
-    )
-
-    height = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_HEIGHT
-        )
-    )
-
-    fourcc = cv2.VideoWriter_fourcc(
-        *"mp4v"
-    )
-
-    out = cv2.VideoWriter(
-        str(output_path),
-        fourcc,
-        fps,
-        (width, height)
-    )
-
-    # --------------------------------------------------------
-    # STATE
-    # --------------------------------------------------------
-
-    state = "WAITING"
-
-    previous_bag_center = None
-    previous_person_center = None
-
-    last_bag_box = None
-
-    hand_points = []
-    last_hand_points = []
-
-    hand_missing = 0
-    bag_missing = 0
-
-    picking_counter = 0
-    picked_counter = 0
-    carrying_counter = 0
-    kept_counter = 0
-    placed_counter = 0
-
-    was_picked = False
-    was_carried = False
-    was_kept = False
-
-    events = []
-
-    frame_number = 0
-
-    # --------------------------------------------------------
-    # LOOP
-    # --------------------------------------------------------
-
-    while True:
-
-        ret, frame = cap.read()
-
-        if not ret:
-            break
-
-        frame_number += 1
-
-        # ====================================================
-        # YOLO PERSON + BAG
-        # ====================================================
-
-        results = model.predict(
-            frame,
-            conf=CONFIDENCE,
-            verbose=False
-        )
-
-        persons = []
-        bags = []
-
-        for result in results:
-
-            if result.boxes is None:
-                continue
-
-            for box in result.boxes:
-
-                class_id = int(
-                    box.cls[0]
-                )
-
-                confidence = float(
-                    box.conf[0]
-                )
-
-                x1, y1, x2, y2 = map(
-                    int,
-                    box.xyxy[0].tolist()
-                )
-
-                box_data = (
-                    x1,
-                    y1,
-                    x2,
-                    y2
-                )
-
-                if class_id == 0:
-
-                    persons.append(
-                        (
-                            box_data,
-                            confidence
-                        )
+                persons.append(
+                    (
+                        detected_box,
+                        confidence
                     )
+                )
 
-                elif class_id == 1:
+            elif class_id == 1:
 
-                    bags.append(
-                        (
-                            box_data,
-                            confidence
-                        )
+                bags.append(
+                    (
+                        detected_box,
+                        confidence
                     )
+                )
 
-        # ====================================================
-        # PERSON
-        # ====================================================
 
-        person_box = None
-        person_center = None
+    # --------------------------------------------------------
+    # PERSON SELECTION
+    # --------------------------------------------------------
 
-        if persons:
+    current_person_box = None
 
-            persons.sort(
-                key=lambda item:
-                (item[0][2] - item[0][0]) *
-                (item[0][3] - item[0][1]),
-                reverse=True
-            )
+    if persons:
 
-            person_box = persons[0][0]
-
-            person_center = center_of_box(
-                person_box
-            )
-
-        # ====================================================
-        # BAG
-        # ====================================================
-
-        bag_boxes = [
-            item[0]
-            for item in bags
-        ]
-
-        selected_bag = nearest_bag(
-            bag_boxes,
-            previous_bag_center
+        # Choose largest person
+        persons.sort(
+            key=lambda item:
+            (item[0][2] - item[0][0]) *
+            (item[0][3] - item[0][1]),
+            reverse=True
         )
 
-        bag_center = None
+        current_person_box = persons[0][0]
 
-        if selected_bag is not None:
+        person_center = center_of_box(
+            current_person_box
+        )
 
-            last_bag_box = selected_bag
+        person_missing_frames = 0
+
+    else:
+
+        person_missing_frames += 1
+
+        if (
+            previous_person_center is not None
+            and person_missing_frames <= PERSON_MEMORY_FRAMES
+        ):
+            person_center = previous_person_center
+
+        else:
+            person_center = None
+
+
+    # --------------------------------------------------------
+    # BAG SELECTION
+    # --------------------------------------------------------
+
+    bag_boxes = [item[0] for item in bags]
+
+    selected_bag = nearest_bag(
+        bag_boxes,
+        previous_bag_center
+    )
+
+    if selected_bag is not None:
+
+        last_bag_box = selected_bag
+
+        bag_center = center_of_box(
+            selected_bag
+        )
+
+        bag_missing_frames = 0
+
+    else:
+
+        bag_missing_frames += 1
+
+        if (
+            last_bag_box is not None
+            and bag_missing_frames <= BAG_MEMORY_FRAMES
+        ):
 
             bag_center = center_of_box(
-                selected_bag
+                last_bag_box
             )
-
-            bag_missing = 0
 
         else:
 
-            bag_missing += 1
+            bag_center = None
 
-            if (
-                last_bag_box is not None
-                and bag_missing <= BAG_MEMORY_FRAMES
-            ):
 
-                bag_center = center_of_box(
-                    last_bag_box
-                )
+    # --------------------------------------------------------
+    # MOVEMENT CALCULATION
+    # --------------------------------------------------------
 
-        # ====================================================
-        # MOVEMENT
-        # ====================================================
+    bag_movement = 0
+    person_movement = 0
 
-        bag_movement = movement(
-            previous_bag_center,
+    if bag_center is not None:
+
+        if previous_bag_center is not None:
+
+            bag_movement = movement_amount(
+                previous_bag_center,
+                bag_center
+            )
+
+            if bag_movement < 2:
+                bag_movement = 0
+
+        total_bag_movement += bag_movement
+
+
+    if person_center is not None:
+
+        if previous_person_center is not None:
+
+            person_movement = movement_amount(
+                previous_person_center,
+                person_center
+            )
+
+            if person_movement < 2:
+                person_movement = 0
+
+        total_person_movement += person_movement
+
+
+    # --------------------------------------------------------
+    # MEDIAPIPE HAND DETECTION
+    # --------------------------------------------------------
+
+    rgb = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB
+    )
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb
+    )
+
+    hand_result = hand_detector.detect(
+        mp_image
+    )
+
+    detected_hands = get_hand_points(
+        hand_result,
+        width,
+        height
+    )
+
+    if detected_hands:
+
+        hand_points = detected_hands
+
+        last_hand_points = detected_hands
+
+        hand_missing_frames = 0
+
+    else:
+
+        hand_missing_frames += 1
+
+        if hand_missing_frames <= HAND_MEMORY_FRAMES:
+
+            hand_points = last_hand_points
+
+        else:
+
+            hand_points = []
+
+
+    # --------------------------------------------------------
+    # HAND / BAG DISTANCE
+    # --------------------------------------------------------
+
+    hand_bag_distance = None
+
+    if (
+        bag_center is not None
+        and hand_points
+    ):
+
+        hand_bag_distance = nearest_hand_distance(
+            hand_points,
             bag_center
         )
 
-        person_movement = movement(
-            previous_person_center,
-            person_center
-        )
 
-        # Remove tiny YOLO jitter
+    # --------------------------------------------------------
+    # GESTURE
+    # --------------------------------------------------------
 
-        if bag_movement < 2:
-            bag_movement = 0
+    gesture = get_gesture(
+        hand_points
+    )
 
-        if person_movement < 2:
-            person_movement = 0
 
-        bag_moving = (
-            bag_movement >=
-            BAG_MOVEMENT_THRESHOLD
-        )
+    # --------------------------------------------------------
+    # RELATIONSHIP CONDITIONS
+    # --------------------------------------------------------
 
-        person_moving = (
-            person_movement >=
-            PERSON_MOVEMENT_THRESHOLD
-        )
+    bag_near_hand = False
 
-        bag_stationary = not bag_moving
+    if hand_bag_distance is not None:
 
-        # ====================================================
-        # MEDIAPIPE HANDS
-        # ====================================================
+        if hand_bag_distance <= HAND_BAG_DISTANCE:
 
-        rgb = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
+            bag_near_hand = True
 
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=rgb
-        )
 
-        hand_result = hand_detector.detect(
-            mp_image
-        )
+    bag_moving = (
+        bag_movement >= BAG_MOVEMENT_THRESHOLD
+    )
 
-        detected_hands = get_hand_points(
-            hand_result,
-            width,
-            height
-        )
+    person_moving = (
+        person_movement >= PERSON_MOVEMENT_THRESHOLD
+    )
 
-        if detected_hands:
+    bag_stationary = (
+        bag_movement < BAG_MOVEMENT_THRESHOLD
+    )
 
-            hand_points = detected_hands
 
-            last_hand_points = (
-                detected_hands
-            )
+    # ========================================================
+    # EVENT STATE MACHINE
+    # ========================================================
 
-            hand_missing = 0
+    # --------------------------------------------------------
+    # 1. WAITING
+    # --------------------------------------------------------
+
+    if state == "WAITING":
+
+        if bag_center is not None:
+
+            state = "BAG DETECTED"
+
+
+    # --------------------------------------------------------
+    # 2. BAG DETECTED
+    # --------------------------------------------------------
+
+    elif state == "BAG DETECTED":
+
+        if (
+            bag_center is not None
+            and person_center is not None
+            and bag_near_hand
+        ):
+
+            picking_counter += 1
 
         else:
 
-            hand_missing += 1
+            picking_counter = max(
+                0,
+                picking_counter - 1
+            )
 
-            if hand_missing <= HAND_MEMORY_FRAMES:
 
-                hand_points = (
-                    last_hand_points
-                )
+        if picking_counter >= PICKING_FRAMES:
 
-            else:
+            state = "PERSON PICKING BAG"
 
-                hand_points = []
+            picking_counter = 0
 
-        # ====================================================
-        # HAND / BAG
-        # ====================================================
 
-        hand_bag_distance = (
-            nearest_hand_distance(
-                hand_points,
-                bag_center
+    # --------------------------------------------------------
+    # 3. PERSON PICKING BAG
+    # --------------------------------------------------------
+
+    elif state == "PERSON PICKING BAG":
+
+        pickup_signal = (
+            bag_near_hand
+            and (
+                bag_moving
+                or person_moving
+                or gesture == "GRAB"
             )
         )
 
-        bag_near_hand = (
-            hand_bag_distance is not None
-            and
-            hand_bag_distance <=
-            HAND_BAG_DISTANCE
-        )
+        if pickup_signal:
 
-        gesture = get_gesture(
-            hand_points
-        )
+            picked_counter += 1
 
-        # ====================================================
-        # STATE MACHINE
-        # ====================================================
+        else:
 
-        old_state = state
-
-        # ----------------------------------------------------
-        # WAITING
-        # ----------------------------------------------------
-
-        if state == "WAITING":
-
-            if bag_center is not None:
-
-                state = "BAG DETECTED"
-
-        # ----------------------------------------------------
-        # BAG DETECTED
-        # ----------------------------------------------------
-
-        elif state == "BAG DETECTED":
-
-            if (
-                person_center is not None
-                and bag_near_hand
-            ):
-
-                picking_counter += 1
-
-            else:
-
-                picking_counter = max(
-                    0,
-                    picking_counter - 1
-                )
-
-            if picking_counter >= PICKING_FRAMES:
-
-                state = (
-                    "PERSON PICKING BAG"
-                )
-
-                picking_counter = 0
-
-        # ----------------------------------------------------
-        # PICKING
-        # ----------------------------------------------------
-
-        elif state == "PERSON PICKING BAG":
-
-            pickup_signal = (
-                bag_near_hand
-                and
-                (
-                    bag_moving
-                    or person_moving
-                    or gesture == "GRAB"
-                )
+            picked_counter = max(
+                0,
+                picked_counter - 1
             )
 
-            if pickup_signal:
 
-                picked_counter += 1
+        if picked_counter >= PICKED_FRAMES:
 
-            else:
+            state = "PERSON PICKED BAG"
 
-                picked_counter = max(
-                    0,
-                    picked_counter - 1
-                )
+            was_picked = True
 
-            if picked_counter >= PICKED_FRAMES:
+            picked_counter = 0
 
-                state = (
-                    "PERSON PICKED BAG"
-                )
 
-                was_picked = True
+    # --------------------------------------------------------
+    # 4. PERSON PICKED BAG
+    # --------------------------------------------------------
 
-                picked_counter = 0
+    elif state == "PERSON PICKED BAG":
 
-        # ----------------------------------------------------
-        # PICKED
-        # ----------------------------------------------------
+        if (
+            bag_center is not None
+            and person_center is not None
+        ):
 
-        elif state == "PERSON PICKED BAG":
+            carrying_counter += 1
 
-            if (
-                person_center is not None
-                and bag_center is not None
-            ):
+        else:
 
-                carrying_counter += 1
+            carrying_counter = max(
+                0,
+                carrying_counter - 1
+            )
 
-            if carrying_counter >= CARRYING_FRAMES:
 
-                state = (
-                    "PERSON CARRYING BAG"
-                )
+        if carrying_counter >= CARRYING_FRAMES:
 
-                was_carried = True
+            state = "PERSON CARRYING BAG"
 
-                carrying_counter = 0
+            was_carried = True
 
-        # ----------------------------------------------------
-        # CARRYING
-        # ----------------------------------------------------
+            carrying_counter = 0
 
-        elif state == "PERSON CARRYING BAG":
 
-            if bag_stationary:
+    # --------------------------------------------------------
+    # 5. PERSON CARRYING BAG
+    # --------------------------------------------------------
 
-                kept_counter += 1
+    elif state == "PERSON CARRYING BAG":
 
-            else:
+        if bag_center is None:
 
-                kept_counter = max(
-                    0,
-                    kept_counter - 1
-                )
-
-            if kept_counter >= KEPT_FRAMES:
-
-                state = (
-                    "PERSON KEPT BAG"
-                )
-
-                was_kept = True
-
-                kept_counter = 0
-
-        # ----------------------------------------------------
-        # KEPT
-        # ----------------------------------------------------
-
-        elif state == "PERSON KEPT BAG":
-
-            if (
-                person_moving
-                and bag_stationary
-                and not bag_near_hand
-            ):
-
-                placed_counter += 1
-
-            else:
-
-                placed_counter = max(
-                    0,
-                    placed_counter - 1
-                )
-
-            if placed_counter >= PLACED_FRAMES:
-
-                state = "BAG PLACED"
-
-                placed_counter = 0
-
-        # ----------------------------------------------------
-        # PLACED
-        # ----------------------------------------------------
-
-        elif state == "BAG PLACED":
+            # Do NOT call it placed.
+            # Just wait for temporary detection recovery.
 
             pass
 
-        # ====================================================
-        # SAVE EVENT
-        # ====================================================
+        elif bag_stationary:
 
-        if state != old_state:
+            kept_counter += 1
 
-            events.append({
-                "frame": frame_number,
-                "state": state
-            })
+        else:
 
-        # ====================================================
-        # DRAW DETECTIONS
-        # ====================================================
-
-        for box, confidence in persons:
-
-            draw_box(
-                frame,
-                box,
-                f"PERSON {confidence:.2f}",
-                (0, 255, 0)
+            kept_counter = max(
+                0,
+                kept_counter - 1
             )
 
-        for box, confidence in bags:
 
-            draw_box(
-                frame,
-                box,
-                f"BAG {confidence:.2f}",
-                (255, 0, 0)
+        if kept_counter >= KEPT_FRAMES:
+
+            state = "PERSON KEPT BAG"
+
+            was_kept = True
+
+            kept_counter = 0
+
+
+    # --------------------------------------------------------
+    # 6. PERSON KEPT BAG
+    # --------------------------------------------------------
+
+    elif state == "PERSON KEPT BAG":
+
+        # Bag must remain stationary.
+        # Person should move away from it.
+
+        if (
+            bag_center is not None
+            and person_center is not None
+            and bag_stationary
+            and person_moving
+            and not bag_near_hand
+        ):
+
+            placed_counter += 1
+
+        else:
+
+            placed_counter = max(
+                0,
+                placed_counter - 1
             )
 
-        # ====================================================
-        # POSE
-        # ====================================================
+
+        if placed_counter >= PLACED_FRAMES:
+
+            state = "BAG PLACED"
+
+            placed_counter = 0
+
+
+    # --------------------------------------------------------
+    # 7. BAG PLACED
+    # --------------------------------------------------------
+
+    elif state == "BAG PLACED":
+
+        # Keep this state.
+        pass
+
+
+    # ========================================================
+    # DRAW PERSON BOXES
+    # ========================================================
+
+    for box, confidence in persons:
+
+        label = f"PERSON {confidence:.2f}"
+
+        draw_box(
+            frame,
+            box,
+            label,
+            (0, 255, 0)
+        )
+
+
+    # ========================================================
+    # DRAW BAG BOXES
+    # ========================================================
+
+    for box, confidence in bags:
+
+        label = f"BAG {confidence:.2f}"
+
+        draw_box(
+            frame,
+            box,
+            label,
+            (255, 0, 0)
+        )
+
+
+    # ========================================================
+    # DRAW POSE
+    # ========================================================
+
+    try:
 
         pose_results = pose_model.predict(
             frame,
@@ -932,185 +1000,288 @@ def process_video(
             pose_results
         )
 
-        # ====================================================
-        # HANDS
-        # ====================================================
+    except Exception:
 
-        draw_hands(
-            frame,
-            hand_points
-        )
+        pass
 
-        # ====================================================
-        # HAND → BAG LINE
-        # ====================================================
 
-        if (
-            bag_center is not None
-            and hand_points
-        ):
+    # ========================================================
+    # DRAW HANDS
+    # ========================================================
 
-            nearest_point = None
-            nearest_distance_value = (
-                float("inf")
-            )
+    draw_hand(
+        frame,
+        hand_points
+    )
 
-            for hand in hand_points:
 
-                for point in hand:
+    # ========================================================
+    # DRAW HAND-BAG CONNECTION
+    # ========================================================
 
-                    d = distance(
-                        point,
-                        bag_center
-                    )
+    if (
+        bag_center is not None
+        and hand_points
+    ):
 
-                    if d < nearest_distance_value:
+        nearest_point = None
+        nearest_distance_value = float("inf")
 
-                        nearest_distance_value = d
-                        nearest_point = point
+        for hand in hand_points:
 
-            if nearest_point:
+            for point in hand:
 
-                cv2.line(
-                    frame,
-                    nearest_point,
-                    bag_center,
-                    (0, 255, 255),
-                    2
+                d = distance(
+                    point,
+                    bag_center
                 )
 
-        # ====================================================
-        # INFORMATION PANEL
-        # ====================================================
+                if d < nearest_distance_value:
 
-        cv2.rectangle(
-            frame,
-            (10, 10),
-            (500, 220),
-            (0, 0, 0),
-            -1
-        )
+                    nearest_distance_value = d
+                    nearest_point = point
 
-        cv2.putText(
-            frame,
-            "VISIONDETECT AI",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (255, 255, 255),
-            2
-        )
 
-        cv2.putText(
-            frame,
-            f"STATE: {state}",
-            (20, 72),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            (0, 255, 255),
-            2
-        )
+        if nearest_point is not None:
 
-        distance_text = (
-            "N/A"
-            if hand_bag_distance is None
-            else f"{hand_bag_distance:.0f}px"
-        )
-
-        cv2.putText(
-            frame,
-            f"Hand-Bag: {distance_text}",
-            (20, 102),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Gesture: {gesture}",
-            (20, 130),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Bag Movement: {bag_movement:.1f}",
-            (20, 158),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Person Movement: {person_movement:.1f}",
-            (20, 186),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (255, 255, 255),
-            2
-        )
-
-        # ====================================================
-        # EVENT BAR
-        # ====================================================
-
-        cv2.rectangle(
-            frame,
-            (10, height - 65),
-            (width - 10, height - 10),
-            (0, 0, 0),
-            -1
-        )
-
-        cv2.putText(
-            frame,
-            state,
-            (30, height - 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 255),
-            3
-        )
-
-        # ====================================================
-        # WRITE FRAME
-        # ====================================================
-
-        out.write(frame)
-
-        # ====================================================
-        # PREVIOUS POSITIONS
-        # ====================================================
-
-        if bag_center is not None:
-            previous_bag_center = bag_center
-
-        if person_center is not None:
-            previous_person_center = (
-                person_center
+            cv2.line(
+                frame,
+                nearest_point,
+                bag_center,
+                (0, 255, 255),
+                2
             )
 
+
     # ========================================================
-    # CLEANUP
+    # STATE DISPLAY
     # ========================================================
 
-    cap.release()
-    out.release()
-    hand_detector.close()
+    if state == "BAG DETECTED":
+        state_color = (255, 255, 0)
 
-    return {
-        "frames_processed": frame_number,
-        "final_state": state,
-        "person_picked": was_picked,
-        "person_carried": was_carried,
-        "person_kept": was_kept,
-        "bag_placed": state == "BAG PLACED",
-        "events": events
-    }
+    elif state == "PERSON PICKING BAG":
+        state_color = (0, 165, 255)
+
+    elif state == "PERSON PICKED BAG":
+        state_color = (0, 255, 255)
+
+    elif state == "PERSON CARRYING BAG":
+        state_color = (0, 255, 0)
+
+    elif state == "PERSON KEPT BAG":
+        state_color = (255, 165, 0)
+
+    elif state == "BAG PLACED":
+        state_color = (255, 0, 255)
+
+    else:
+        state_color = (255, 255, 255)
+
+
+    # ========================================================
+    # TOP INFORMATION PANEL
+    # ========================================================
+
+    cv2.rectangle(
+        frame,
+        (10, 10),
+        (470, 245),
+        (0, 0, 0),
+        -1
+    )
+
+    cv2.putText(
+        frame,
+        "AI PERSON + BAG MOVEMENT",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"STATE: {state}",
+        (20, 72),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        state_color,
+        2
+    )
+
+    if hand_bag_distance is None:
+        distance_text = "N/A"
+    else:
+        distance_text = f"{hand_bag_distance:.0f} px"
+
+    cv2.putText(
+        frame,
+        f"Hand-Bag Distance: {distance_text}",
+        (20, 102),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"Gesture: {gesture}",
+        (20, 130),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"Bag Movement: {bag_movement:.1f}",
+        (20, 158),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"Person Movement: {person_movement:.1f}",
+        (20, 186),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    hand_status = (
+        "LIVE"
+        if hand_missing_frames == 0
+        else "MEMORY"
+    )
+
+    cv2.putText(
+        frame,
+        f"HAND: {hand_status}",
+        (20, 214),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 255),
+        2
+    )
+
+
+    # ========================================================
+    # EVENT MESSAGE
+    # ========================================================
+
+    event_message = state
+
+    cv2.rectangle(
+        frame,
+        (10, height - 75),
+        (width - 10, height - 10),
+        (0, 0, 0),
+        -1
+    )
+
+    cv2.putText(
+        frame,
+        event_message,
+        (30, height - 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        state_color,
+        3
+    )
+
+
+    # ========================================================
+    # FRAME NUMBER
+    # ========================================================
+
+    cv2.putText(
+        frame,
+        f"Frame: {frame_number}",
+        (width - 180, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+
+    # ========================================================
+    # SAVE OUTPUT
+    # ========================================================
+
+    out.write(frame)
+
+
+    # ========================================================
+    # LIVE DISPLAY
+    # ========================================================
+
+    cv2.imshow(
+        WINDOW_NAME,
+        frame
+    )
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("q"):
+        print()
+        print("Q PRESSED - STOPPING...")
+        break
+
+
+    # ========================================================
+    # UPDATE PREVIOUS POSITIONS
+    # ========================================================
+
+    if bag_center is not None:
+        previous_bag_center = bag_center
+
+    if person_center is not None:
+        previous_person_center = person_center
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+cap.release()
+
+out.release()
+
+hand_detector.close()
+
+cv2.destroyAllWindows()
+
+cv2.waitKey(1)
+
+
+# ============================================================
+# FINAL RESULT
+# ============================================================
+
+print()
+print("======================================")
+print("PROCESSING COMPLETE")
+print("======================================")
+
+print(f"Frames processed: {frame_number}")
+print(f"Final state: {state}")
+print(f"Output: {OUTPUT_PATH}")
+
+print()
+print("EVENT SUMMARY")
+print("--------------------------------------")
+print(f"Bag detected: {'YES' if last_bag_box is not None else 'NO'}")
+print(f"Person picked bag: {'YES' if was_picked else 'NO'}")
+print(f"Person carried bag: {'YES' if was_carried else 'NO'}")
+print(f"Person kept bag: {'YES' if was_kept else 'NO'}")
+print(f"Bag placed: {'YES' if state == 'BAG PLACED' else 'NO'}")
+print("--------------------------------------")
